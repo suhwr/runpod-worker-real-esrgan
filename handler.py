@@ -5,6 +5,7 @@ import base64
 import cv2
 import glob
 import traceback
+import requests
 import runpod
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.modules.rp_logger import RunPodLogger
@@ -28,6 +29,80 @@ TMP_PATH = f'{VOLUME_PATH}/tmp'
 MODELS_PATH = f'{VOLUME_PATH}/models/ESRGAN'
 GFPGAN_MODEL_PATH = f'{VOLUME_PATH}/models/GFPGAN/GFPGANv1.3.pth'
 logger = RunPodLogger()
+
+
+DEFAULT_CATBOX_USER_HASH = os.getenv("CATBOX_USER_HASH", "0f9dc6f11f2f5ac4241235974")
+
+
+def _upload_uguu(file_path):
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://uguu.se/upload",
+            params={"output": "json"},
+            files={"files[]": (os.path.basename(file_path), f)},
+            timeout=45,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        files = data.get("files")
+        if files and len(files) > 0 and files[0].get("url"):
+            return files[0]["url"]
+        raise ValueError(f"Uguu response invalid: {data}")
+
+
+def _upload_catbox(file_path, user_hash=None):
+    data = {"reqtype": "fileupload"}
+    hash_to_use = user_hash or DEFAULT_CATBOX_USER_HASH
+    if hash_to_use:
+        data["userhash"] = hash_to_use
+
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://catbox.moe/user/api.php",
+            data=data,
+            files={"fileToUpload": (os.path.basename(file_path), f)},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        url = resp.text.strip()
+        if url.startswith("https://"):
+            return url
+        raise ValueError(f"Catbox failed with response: {url}")
+
+
+def _upload_ucarecdn(file_path, pub_key="demopublickey"):
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://upload.uploadcare.com/base/",
+            data={
+                "UPLOADCARE_PUB_KEY": pub_key,
+                "UPLOADCARE_STORE": "1",
+            },
+            files={"file": (os.path.basename(file_path), f)},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        file_id = resp.json().get("file")
+        if file_id:
+            return f"https://ucarecdn.com/{file_id}/{os.path.basename(file_path)}"
+        raise ValueError(f"Uploadcare failed: {resp.text}")
+
+
+def upload_with_fallback(file_path, catbox_hash=None):
+    errors = []
+    try:
+        return _upload_uguu(file_path), "uguu"
+    except Exception as exc:
+        errors.append(f"uguu: {exc}")
+    try:
+        return _upload_catbox(file_path, user_hash=catbox_hash), "catbox"
+    except Exception as exc:
+        errors.append(f"catbox: {exc}")
+    try:
+        return _upload_ucarecdn(file_path), "ucarecdn"
+    except Exception as exc:
+        errors.append(f"ucarecdn: {exc}")
+    raise RuntimeError("All uploaders failed: " + " | ".join(errors))
 
 
 # ---------------------------------------------------------------------------- #
@@ -166,7 +241,16 @@ def upscale(
         output_buffer = io.BytesIO()
         result_image.save(output_buffer, format=image_format)
         image_data = output_buffer.getvalue()
-        return base64.b64encode(image_data).decode('utf-8')
+
+        # If PNG and > 7MB, try compressing to high quality JPEG to save payload size
+        if len(image_data) > 7 * 1024 * 1024 and image_format == 'PNG':
+            jpeg_buffer = io.BytesIO()
+            result_image.save(jpeg_buffer, format='JPEG', quality=95)
+            if len(jpeg_buffer.getvalue()) <= 7 * 1024 * 1024:
+                image_data = jpeg_buffer.getvalue()
+                image_format = 'JPEG'
+
+        return image_data, image_format
 
 
 def determine_file_extension(image_data):
@@ -210,7 +294,7 @@ def upscaling_api(input):
         source_file.write(source_image)
 
     try:
-        result_image = upscale(
+        image_data, image_format = upscale(
             source_image_path,
             source_file_extension,
             model_name,
@@ -230,10 +314,31 @@ def upscaling_api(input):
         }
 
     # Clean up temporary images
-    os.remove(source_image_path)
+    if os.path.exists(source_image_path):
+        os.remove(source_image_path)
+
+    # If image exceeds ~7MB (safe margin for RunPod 10MB limit), upload to file host
+    if len(image_data) > 7 * 1024 * 1024:
+        ext = '.jpg' if image_format == 'JPEG' else '.png'
+        out_filename = f'upscaled_{unique_id}{ext}'
+        temp_out_path = f'{TMP_PATH}/{out_filename}'
+        with open(temp_out_path, 'wb') as f:
+            f.write(image_data)
+        try:
+            uploaded_url, provider = upload_with_fallback(temp_out_path)
+            return {
+                'image': '',
+                'image_url': uploaded_url,
+                'provider': provider
+            }
+        except Exception as upload_err:
+            logger.error(f'Upload fallback failed: {upload_err}')
+        finally:
+            if os.path.exists(temp_out_path):
+                os.remove(temp_out_path)
 
     return {
-        'image': result_image
+        'image': base64.b64encode(image_data).decode('utf-8')
     }
 
 

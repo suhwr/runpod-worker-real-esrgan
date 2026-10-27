@@ -7,4 +7,5 @@ torch
 torchvision
 tqdm
 python-dotenv
+requests
 runpod==1.7.10
