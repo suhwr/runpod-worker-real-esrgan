@@ -7,6 +7,7 @@ import cv2
 import glob
 import traceback
 import requests
+import torch
 import runpod
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.modules.rp_logger import RunPodLogger
@@ -28,7 +29,11 @@ GPU_ID = 0
 TMP_PATH = f'{VOLUME_PATH}/tmp'
 MODELS_PATH = f'{VOLUME_PATH}/models/ESRGAN'
 GFPGAN_MODEL_PATH = f'{VOLUME_PATH}/models/GFPGAN/GFPGANv1.3.pth'
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))
+
+DEFAULT_FALLBACK_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))
+MAX_CONCURRENCY_CAP = int(os.getenv("MAX_CONCURRENCY_CAP", "8"))
+VRAM_PER_IMAGE_GB = float(os.getenv("VRAM_PER_IMAGE_GB", "1.0"))
+SAFETY_BUFFER_GB = float(os.getenv("SAFETY_BUFFER_GB", "1.5"))
 
 logger = RunPodLogger()
 gpu_lock = asyncio.Lock()
@@ -335,11 +340,29 @@ async def handler(event):
 
 
 def concurrency_controller(current_concurrency):
-    return MAX_CONCURRENCY
+    """
+    Dynamically adjusts allowed concurrency based on real-time free VRAM.
+    If GPU query fails or CUDA is unavailable, gracefully falls back to DEFAULT_FALLBACK_CONCURRENCY.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return DEFAULT_FALLBACK_CONCURRENCY
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device=0)
+        free_gb = free_bytes / (1024 ** 3)
+
+        usable_vram = max(0.0, free_gb - SAFETY_BUFFER_GB)
+        extra_slots = int(usable_vram // VRAM_PER_IMAGE_GB)
+        target = current_concurrency + extra_slots
+
+        return max(1, min(target, MAX_CONCURRENCY_CAP))
+    except Exception as exc:
+        logger.error(f'Failed to calculate dynamic VRAM concurrency ({exc}), fallback to {DEFAULT_FALLBACK_CONCURRENCY}')
+        return DEFAULT_FALLBACK_CONCURRENCY
 
 
 if __name__ == "__main__":
-    logger.info(f'Starting Serverless Worker (Concurrency={MAX_CONCURRENCY})...')
+    logger.info(f'Starting Serverless Worker (Dynamic Concurrency, Fallback={DEFAULT_FALLBACK_CONCURRENCY})...')
     runpod.serverless.start({
         'handler': handler,
         'concurrency_modifier': concurrency_controller
