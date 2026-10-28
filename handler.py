@@ -28,6 +28,7 @@ GFPGAN_MODEL_PATH = f'{VOLUME_PATH}/models/GFPGAN/GFPGANv1.3.pth'
 
 logger = RunPodLogger()
 
+MAX_CONCURRENCY = max(1, int(os.getenv("MAX_CONCURRENCY", "1")))
 DEFAULT_CATBOX_USER_HASH = os.getenv("CATBOX_USER_HASH", "0f9dc6f11f2f5ac4241235974")
 
 # Global caches to prevent model reloading on every inference
@@ -371,8 +372,16 @@ def handler(event):
     }
 
 
+def concurrency_controller(current_concurrency):
+    return MAX_CONCURRENCY
+
+
 if __name__ == "__main__":
-    logger.info("Starting Serverless Worker (Sequential Queue, Concurrency=1, Adaptive Tiling)...")
-    runpod.serverless.start({
+    logger.info(f"Starting Serverless Worker (Max Concurrency: {MAX_CONCURRENCY}, Adaptive Tiling)...")
+    start_params = {
         'handler': handler
-    })
+    }
+    if MAX_CONCURRENCY > 1:
+        start_params['concurrency_modifier'] = concurrency_controller
+
+    runpod.serverless.start(start_params)
