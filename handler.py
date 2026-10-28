@@ -1,10 +1,8 @@
-import asyncio
 import os
 import io
 import uuid
 import base64
 import cv2
-import glob
 import traceback
 import requests
 import torch
@@ -12,8 +10,6 @@ import runpod
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.modules.rp_logger import RunPodLogger
 from basicsr.archs.rrdbnet_arch import RRDBNet
-from basicsr.utils.download_util import load_file_from_url
-from realesrgan import RealESRGANer
 from PIL import Image
 from schemas.input import INPUT_SCHEMA
 
@@ -30,13 +26,7 @@ TMP_PATH = f'{VOLUME_PATH}/tmp'
 MODELS_PATH = f'{VOLUME_PATH}/models/ESRGAN'
 GFPGAN_MODEL_PATH = f'{VOLUME_PATH}/models/GFPGAN/GFPGANv1.3.pth'
 
-DEFAULT_FALLBACK_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))
-MAX_CONCURRENCY_CAP = int(os.getenv("MAX_CONCURRENCY_CAP", "8"))
-VRAM_PER_IMAGE_GB = float(os.getenv("VRAM_PER_IMAGE_GB", "1.0"))
-SAFETY_BUFFER_GB = float(os.getenv("SAFETY_BUFFER_GB", "1.5"))
-
 logger = RunPodLogger()
-gpu_lock = asyncio.Lock()
 
 DEFAULT_CATBOX_USER_HASH = os.getenv("CATBOX_USER_HASH", "0f9dc6f11f2f5ac4241235974")
 
@@ -117,12 +107,37 @@ def upload_with_fallback(file_path, catbox_hash=None):
 
 
 # ---------------------------------------------------------------------------- #
-# Application Functions                                                        #
+# Adaptive Tiling Helper                                                       #
+# ---------------------------------------------------------------------------- #
+def calculate_adaptive_tile(w, h, user_tile=0):
+    """
+    Determines ideal tile size based on image resolution to balance
+    speed, visual seamlessness, and VRAM stability.
+    - If user specifies a positive tile, cap at 1024 to prevent memory blowup.
+    - Standard images (<= 2.5M pixels, ~1920x1280): tile=0 (1 pass, blazing fast).
+    - Large images (2.5M - 8M pixels, ~3200x2500): tile=1024 (few tiles, high speed, OOM-safe).
+    - Huge images (> 8M pixels, e.g. 4864x3328 = 16.2M): tile=768 (strictly bounds VRAM < 2.5GB).
+    """
+    total_pixels = w * h
+    if user_tile and user_tile > 0:
+        return min(user_tile, 1024)
+
+    if total_pixels <= 2_500_000:
+        return 0
+    elif total_pixels <= 8_000_000:
+        return 1024
+    else:
+        return 768
+
+
+# ---------------------------------------------------------------------------- #
+# Model Loading & Caching                                                      #
 # ---------------------------------------------------------------------------- #
 def get_upsampler(model_name, netscale, model, model_path, tile, tile_pad, pre_pad, half):
-    cache_key = (model_name, netscale, tile, half)
+    from realesrgan import RealESRGANer
+    cache_key = (model_name, netscale, half)
     if cache_key not in UPSAMPLER_CACHE:
-        logger.info(f"Loading {model_name} into VRAM cache...")
+        logger.info(f"Loading {model_name} (half={half}) into VRAM cache...")
         UPSAMPLER_CACHE[cache_key] = RealESRGANer(
             scale=netscale,
             model_path=model_path,
@@ -134,7 +149,11 @@ def get_upsampler(model_name, netscale, model, model_path, tile, tile_pad, pre_p
             half=half,
             gpu_id=GPU_ID
         )
-    return UPSAMPLER_CACHE[cache_key]
+    upsampler = UPSAMPLER_CACHE[cache_key]
+    upsampler.tile_size = tile
+    upsampler.tile_pad = tile_pad
+    upsampler.pre_pad = pre_pad
+    return upsampler
 
 
 def get_face_enhancer(outscale, upsampler):
@@ -199,23 +218,42 @@ def upscale(
     if not os.path.isfile(model_path):
         raise Exception(f'Could not find model: {model_path}')
 
+    img = cv2.imread(source_image_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f'Source image ({source_image_path}) is corrupt')
+
+    h, w = img.shape[:2]
+    total_pixels = w * h
+
+    # Safety ceiling for extreme resolution images (> 25M pixels)
+    MAX_PIXELS = 25_000_000
+    if total_pixels > MAX_PIXELS:
+        logger.info(f"Image has {total_pixels} pixels, resizing within {MAX_PIXELS} ceiling")
+        scale_factor = (MAX_PIXELS / total_pixels) ** 0.5
+        new_w = int(w * scale_factor)
+        new_h = int(h * scale_factor)
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        h, w = new_h, new_w
+
+    # Determine adaptive tile
+    effective_tile = calculate_adaptive_tile(w, h, user_tile=tile)
+    effective_half = half if half is not None else torch.cuda.is_available()
+
+    logger.info(f"Processing image {w}x{h} ({w*h} px) with tile={effective_tile}, tile_pad={tile_pad}, half={effective_half}")
+
     upsampler = get_upsampler(
         model_name=model_name,
         netscale=netscale,
         model=model,
         model_path=model_path,
-        tile=tile,
+        tile=effective_tile,
         tile_pad=tile_pad,
         pre_pad=pre_pad,
-        half=half
+        half=effective_half
     )
 
     if face_enhance:
         face_enhancer = get_face_enhancer(outscale, upsampler)
-
-    img = cv2.imread(source_image_path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise RuntimeError(f'Source image ({source_image_path}) is corrupt')
 
     try:
         if face_enhance:
@@ -260,9 +298,9 @@ def _save_source_image(source_image_b64, target_path):
 
 
 # ---------------------------------------------------------------------------- #
-# Asynchronous Serverless Handler with GPU Concurrency Control                 #
+# Serverless Handler (Sequential Hardcoded Queue, Concurrency=1)               #
 # ---------------------------------------------------------------------------- #
-async def handler(event):
+def handler(event):
     if not os.path.exists(TMP_PATH):
         os.makedirs(TMP_PATH, exist_ok=True)
 
@@ -271,32 +309,25 @@ async def handler(event):
         return {'errors': validated_input['errors']}
 
     input_data = validated_input['validated_input']
-    loop = asyncio.get_running_loop()
-
     unique_id = uuid.uuid4()
     source_image_data = input_data['source_image']
     source_file_extension = determine_file_extension(source_image_data)
     source_image_path = f'{TMP_PATH}/source_{unique_id}{source_file_extension}'
 
-    # 1. Non-blocking disk write
-    await loop.run_in_executor(None, _save_source_image, source_image_data, source_image_path)
+    _save_source_image(source_image_data, source_image_path)
 
     try:
-        # 2. Acquire GPU lock for inference
-        async with gpu_lock:
-            image_data, image_format = await loop.run_in_executor(
-                None,
-                upscale,
-                source_image_path,
-                source_file_extension,
-                input_data['model'],
-                input_data['scale'],
-                input_data['face_enhance'],
-                input_data['tile'],
-                input_data['tile_pad'],
-                input_data['pre_pad'],
-                input_data['half']
-            )
+        image_data, image_format = upscale(
+            source_image_path,
+            source_file_extension,
+            input_data['model'],
+            input_data['scale'],
+            input_data['face_enhance'],
+            input_data.get('tile', 0),
+            input_data.get('tile_pad', 10),
+            input_data.get('pre_pad', 0),
+            input_data.get('half', False)
+        )
     except Exception as e:
         logger.error(f'An exception was raised: {e}')
         return {
@@ -304,14 +335,15 @@ async def handler(event):
             'refresh_worker': True
         }
     finally:
-        # Clean up temporary source image
         if os.path.exists(source_image_path):
             try:
                 os.remove(source_image_path)
             except Exception:
                 pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # 3. Handle large payload / upload fallback non-blocking (outside GPU lock)
+    # Handle large payload / upload fallback
     if len(image_data) > 7 * 1024 * 1024:
         ext = '.jpg' if image_format == 'JPEG' else '.png'
         out_filename = f'upscaled_{unique_id}{ext}'
@@ -319,7 +351,7 @@ async def handler(event):
         with open(temp_out_path, 'wb') as f:
             f.write(image_data)
         try:
-            uploaded_url, provider = await loop.run_in_executor(None, upload_with_fallback, temp_out_path)
+            uploaded_url, provider = upload_with_fallback(temp_out_path)
             return {
                 'image': '',
                 'image_url': uploaded_url,
@@ -339,61 +371,8 @@ async def handler(event):
     }
 
 
-def get_real_free_vram_gb(device=0):
-    """
-    Returns (usable_free_gb, total_gb).
-    Combines driver-level unallocated memory and PyTorch internal reusable cache
-    (reserved - allocated) to prevent under-reporting available VRAM due to the caching allocator.
-    """
-    driver_free_bytes, total_bytes = torch.cuda.mem_get_info(device=device)
-    allocated_bytes = torch.cuda.memory_allocated(device=device)
-    reserved_bytes = torch.cuda.memory_reserved(device=device)
-    reusable_cached = max(0, reserved_bytes - allocated_bytes)
-    true_free_bytes = driver_free_bytes + reusable_cached
-    return true_free_bytes / (1024 ** 3), total_bytes / (1024 ** 3)
-
-
-def concurrency_controller(current_concurrency):
-    """
-    Dynamically adjusts allowed concurrency based on real-time hardware VRAM.
-    Adapts max ceiling according to installed GPU memory size:
-      - <=8.5 GB  (e.g., T4, RTX 3070)        : cap 2
-      - <=16.5 GB (e.g., RTX 4000 Ada, A4000)   : cap 5
-      - <=24.5 GB (e.g., RTX 3090, RTX 4090)    : cap 6
-      - >24.5 GB  (e.g., A100, H100)            : cap 10
-    Falls back gracefully to DEFAULT_FALLBACK_CONCURRENCY on any measurement anomaly.
-    """
-    try:
-        if not torch.cuda.is_available():
-            return DEFAULT_FALLBACK_CONCURRENCY
-
-        true_free_gb, total_gb = get_real_free_vram_gb(device=0)
-
-        # Hardware-adaptive ceiling based on total GPU capacity
-        if total_gb <= 8.5:
-            hw_cap = 2
-        elif total_gb <= 16.5:
-            hw_cap = 5
-        elif total_gb <= 24.5:
-            hw_cap = 6
-        else:
-            hw_cap = 10
-
-        effective_cap = min(MAX_CONCURRENCY_CAP, hw_cap)
-
-        usable_vram = max(0.0, true_free_gb - SAFETY_BUFFER_GB)
-        extra_slots = int(usable_vram // VRAM_PER_IMAGE_GB)
-        target = current_concurrency + extra_slots
-
-        return max(1, min(target, effective_cap))
-    except Exception as exc:
-        logger.error(f'Failed to calculate dynamic VRAM concurrency ({exc}), fallback to {DEFAULT_FALLBACK_CONCURRENCY}')
-        return DEFAULT_FALLBACK_CONCURRENCY
-
-
 if __name__ == "__main__":
-    logger.info(f'Starting Serverless Worker (Dynamic Concurrency, Fallback={DEFAULT_FALLBACK_CONCURRENCY})...')
+    logger.info("Starting Serverless Worker (Sequential Queue, Concurrency=1, Adaptive Tiling)...")
     runpod.serverless.start({
-        'handler': handler,
-        'concurrency_modifier': concurrency_controller
+        'handler': handler
     })
