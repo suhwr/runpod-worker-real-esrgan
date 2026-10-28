@@ -339,23 +339,53 @@ async def handler(event):
     }
 
 
+def get_real_free_vram_gb(device=0):
+    """
+    Returns (usable_free_gb, total_gb).
+    Combines driver-level unallocated memory and PyTorch internal reusable cache
+    (reserved - allocated) to prevent under-reporting available VRAM due to the caching allocator.
+    """
+    driver_free_bytes, total_bytes = torch.cuda.mem_get_info(device=device)
+    allocated_bytes = torch.cuda.memory_allocated(device=device)
+    reserved_bytes = torch.cuda.memory_reserved(device=device)
+    reusable_cached = max(0, reserved_bytes - allocated_bytes)
+    true_free_bytes = driver_free_bytes + reusable_cached
+    return true_free_bytes / (1024 ** 3), total_bytes / (1024 ** 3)
+
+
 def concurrency_controller(current_concurrency):
     """
-    Dynamically adjusts allowed concurrency based on real-time free VRAM.
-    If GPU query fails or CUDA is unavailable, gracefully falls back to DEFAULT_FALLBACK_CONCURRENCY.
+    Dynamically adjusts allowed concurrency based on real-time hardware VRAM.
+    Adapts max ceiling according to installed GPU memory size:
+      - <=8.5 GB  (e.g., T4, RTX 3070)        : cap 2
+      - <=16.5 GB (e.g., RTX 4000 Ada, A4000)   : cap 5
+      - <=24.5 GB (e.g., RTX 3090, RTX 4090)    : cap 6
+      - >24.5 GB  (e.g., A100, H100)            : cap 10
+    Falls back gracefully to DEFAULT_FALLBACK_CONCURRENCY on any measurement anomaly.
     """
     try:
         if not torch.cuda.is_available():
             return DEFAULT_FALLBACK_CONCURRENCY
 
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device=0)
-        free_gb = free_bytes / (1024 ** 3)
+        true_free_gb, total_gb = get_real_free_vram_gb(device=0)
 
-        usable_vram = max(0.0, free_gb - SAFETY_BUFFER_GB)
+        # Hardware-adaptive ceiling based on total GPU capacity
+        if total_gb <= 8.5:
+            hw_cap = 2
+        elif total_gb <= 16.5:
+            hw_cap = 5
+        elif total_gb <= 24.5:
+            hw_cap = 6
+        else:
+            hw_cap = 10
+
+        effective_cap = min(MAX_CONCURRENCY_CAP, hw_cap)
+
+        usable_vram = max(0.0, true_free_gb - SAFETY_BUFFER_GB)
         extra_slots = int(usable_vram // VRAM_PER_IMAGE_GB)
         target = current_concurrency + extra_slots
 
-        return max(1, min(target, MAX_CONCURRENCY_CAP))
+        return max(1, min(target, effective_cap))
     except Exception as exc:
         logger.error(f'Failed to calculate dynamic VRAM concurrency ({exc}), fallback to {DEFAULT_FALLBACK_CONCURRENCY}')
         return DEFAULT_FALLBACK_CONCURRENCY
