@@ -407,7 +407,14 @@ def upscale(
 
 def determine_file_extension(image_data):
     try:
-        if image_data.startswith('/9j/'):
+        if image_data.startswith("http://") or image_data.startswith("https://"):
+            url_path = urllib.parse.urlsplit(image_data).path.lower()
+            if url_path.endswith((".jpg", ".jpeg")):
+                return ".jpg"
+            elif url_path.endswith(".png"):
+                return ".png"
+            return ".png"
+        elif image_data.startswith('/9j/'):
             return '.jpg'
         elif image_data.startswith('iVBORw0Kg'):
             return '.png'
@@ -417,10 +424,17 @@ def determine_file_extension(image_data):
         return '.png'
 
 
-def _save_source_image(source_image_b64, target_path):
-    source_bytes = base64.b64decode(source_image_b64)
-    with open(target_path, 'wb') as f:
-        f.write(source_bytes)
+def _save_source_image(source_image_data, target_path):
+    if source_image_data.startswith("http://") or source_image_data.startswith("https://"):
+        logger.info(f"Downloading source image from URL: {source_image_data[:80]}...")
+        resp = requests.get(source_image_data, timeout=60)
+        resp.raise_for_status()
+        with open(target_path, 'wb') as f:
+            f.write(resp.content)
+    else:
+        source_bytes = base64.b64decode(source_image_data)
+        with open(target_path, 'wb') as f:
+            f.write(source_bytes)
 
 
 # ---------------------------------------------------------------------------- #
