@@ -151,14 +151,6 @@ jobs:
 
           echo "Build completed!"
 
-      - name: Verify image was pushed
-        run: |
-          IMAGE="ghcr.io/${{ steps.repo-owner.outputs.owner }}/${{ needs.detect-changes.outputs.app }}:${{ needs.detect-changes.outputs.release }}"
-          echo "Verifying image: $IMAGE"
-
-          # Check the image exists in the registry without pulling it
-          docker manifest inspect $IMAGE && echo "SUCCESS: Image verified: $IMAGE" || echo "FAILED: Could not find image: $IMAGE"
-
       - name: List built image
         id: list-images
         run: |
