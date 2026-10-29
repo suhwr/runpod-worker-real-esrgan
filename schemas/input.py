@@ -43,6 +43,6 @@ INPUT_SCHEMA = {
     'half': {
         'type': bool,
         'required': False,
-        'default': False
+        'default': True
     }
 }

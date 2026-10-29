@@ -2,6 +2,10 @@ import os
 import io
 import uuid
 import base64
+import time
+import hashlib
+import mimetypes
+import urllib.parse
 import cv2
 import traceback
 import requests
@@ -34,6 +38,118 @@ DEFAULT_CATBOX_USER_HASH = os.getenv("CATBOX_USER_HASH", "0f9dc6f11f2f5ac4241235
 # Global caches to prevent model reloading on every inference
 UPSAMPLER_CACHE = {}
 GFPGAN_CACHE = {}
+
+
+def _upload_b2(file_path, folder="tmp/esrgan"):
+    """Upload to Backblaze B2 (boto3 S3 or native REST) under tmp/ prefix."""
+    key_id = os.environ.get("B2_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
+    app_key = os.environ.get("B2_APPLICATION_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    bucket = os.environ.get("B2_BUCKET_NAME")
+    endpoint = os.environ.get("B2_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT_URL")
+
+    if not (key_id and app_key and bucket):
+        raise ValueError("Backblaze B2 credentials (B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME) not set")
+
+    fname = os.path.basename(file_path)
+    clean_folder = folder.strip("/")
+    target_key = f"{clean_folder}/{int(time.time())}_{uuid.uuid4().hex[:8]}_{fname}"
+    content_type, _ = mimetypes.guess_type(str(file_path))
+    if not content_type:
+        content_type = "image/png"
+
+    # Attempt 1: boto3 S3 API if endpoint is set
+    if endpoint:
+        try:
+            import boto3
+            from botocore.config import Config
+
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=key_id,
+                aws_secret_access_key=app_key,
+                config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+            )
+            with open(file_path, "rb") as f:
+                s3.upload_fileobj(f, bucket, target_key, ExtraArgs={"ContentType": content_type})
+
+            public_prefix = os.environ.get("B2_PUBLIC_URL_PREFIX", "").rstrip("/")
+            if public_prefix:
+                return f"{public_prefix}/{target_key}"
+
+            try:
+                return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": target_key}, ExpiresIn=86400)
+            except Exception:
+                parsed = urllib.parse.urlsplit(endpoint)
+                return f"{parsed.scheme}://{bucket}.{parsed.netloc}/{target_key}"
+        except ImportError:
+            pass
+
+    # Attempt 2: B2 Native REST API
+    auth_resp = requests.get(
+        "https://api.backblazeb2.com/b2api/v3/b2_authorize_account",
+        auth=(key_id, app_key),
+        timeout=30,
+    )
+    auth_resp.raise_for_status()
+    auth_data = auth_resp.json()
+    api_url = auth_data["apiUrl"]
+    auth_token = auth_data["authorizationToken"]
+    download_url = auth_data["downloadUrl"]
+
+    bucket_id = os.environ.get("B2_BUCKET_ID") or auth_data.get("allowed", {}).get("bucketId")
+    if not bucket_id:
+        lb_resp = requests.post(
+            f"{api_url}/b2api/v3/b2_list_buckets",
+            headers={"Authorization": auth_token},
+            json={"accountId": auth_data["accountId"], "bucketName": bucket},
+            timeout=30,
+        )
+        lb_resp.raise_for_status()
+        buckets = lb_resp.json().get("buckets", [])
+        if buckets:
+            bucket_id = buckets[0]["bucketId"]
+        else:
+            raise ValueError(f"B2 bucket '{bucket}' not found")
+
+    up_resp = requests.post(
+        f"{api_url}/b2api/v3/b2_get_upload_url",
+        headers={"Authorization": auth_token},
+        json={"bucketId": bucket_id},
+        timeout=30,
+    )
+    up_resp.raise_for_status()
+    up_data = up_resp.json()
+    upload_url = up_data["uploadUrl"]
+    upload_token = up_data["authorizationToken"]
+
+    sha1 = hashlib.sha1()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            sha1.update(chunk)
+    digest = sha1.hexdigest()
+
+    file_size = os.path.getsize(file_path)
+    with open(file_path, "rb") as f:
+        res = requests.post(
+            upload_url,
+            headers={
+                "Authorization": upload_token,
+                "X-Bz-File-Name": urllib.parse.quote(target_key),
+                "Content-Type": content_type,
+                "Content-Length": str(file_size),
+                "X-Bz-Content-Sha1": digest,
+            },
+            data=f,
+            timeout=120,
+        )
+        res.raise_for_status()
+
+    public_prefix = os.environ.get("B2_PUBLIC_URL_PREFIX", "").rstrip("/")
+    if public_prefix:
+        return f"{public_prefix}/{target_key}"
+
+    return f"{download_url}/file/{bucket}/{target_key}"
 
 
 def _upload_uguu(file_path):
@@ -92,6 +208,15 @@ def _upload_ucarecdn(file_path, pub_key="demopublickey"):
 
 def upload_with_fallback(file_path, catbox_hash=None):
     errors = []
+
+    # 1. Backblaze B2 (tmp/ auto-expire lifecycle)
+    if os.environ.get("B2_APPLICATION_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        try:
+            return _upload_b2(file_path, folder="tmp/esrgan"), "backblaze_b2"
+        except Exception as exc:
+            logger.warn(f"Backblaze B2 upload failed ({exc}), falling back...")
+            errors.append(f"b2: {exc}")
+
     try:
         return _upload_uguu(file_path), "uguu"
     except Exception as exc:
@@ -327,7 +452,7 @@ def handler(event):
             input_data.get('tile', 0),
             input_data.get('tile_pad', 10),
             input_data.get('pre_pad', 0),
-            input_data.get('half', False)
+            input_data.get('half', torch.cuda.is_available())
         )
     except Exception as e:
         logger.error(f'An exception was raised: {e}')
