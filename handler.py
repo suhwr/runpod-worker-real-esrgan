@@ -1,4 +1,9 @@
 import os
+
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "0")
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
 import io
 import uuid
 import base64

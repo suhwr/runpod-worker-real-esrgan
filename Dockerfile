@@ -3,7 +3,10 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=0 \
+    CUDA_MODULE_LOADING=LAZY \
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -29,6 +32,7 @@ RUN apt update && \
       libxext6 \
       ffmpeg \
       libgoogle-perftools-dev \
+      libjemalloc2 \
       procps && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* && \
@@ -74,5 +78,6 @@ ADD start.sh /start.sh
 ADD handler.py /workspace/runpod-worker-real-esrgan/handler.py
 
 # Start the container
-RUN chmod +x /start.sh
+RUN chmod +x /start.sh \
+    && python3 -m compileall -q /workspace /usr/local/lib/python3.10/dist-packages || true
 ENTRYPOINT /start.sh
