@@ -15,6 +15,12 @@ import cv2
 import traceback
 import requests
 import torch
+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
 import runpod
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.modules.rp_logger import RunPodLogger
@@ -521,6 +527,14 @@ def concurrency_controller(current_concurrency):
 
 
 if __name__ == "__main__":
+    if torch.cuda.is_available():
+        try:
+            _cap = torch.cuda.get_device_capability(0)
+            _name = torch.cuda.get_device_name(0)
+            _vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            logger.info(f"GPU Hardware: {_name} (sm_{_cap[0]}{_cap[1]}, {_vram:.2f} GB VRAM) — PyTorch {torch.__version__}")
+        except Exception:
+            pass
     logger.info(f"Starting Serverless Worker (Max Concurrency: {MAX_CONCURRENCY}, Adaptive Tiling)...")
     start_params = {
         'handler': handler

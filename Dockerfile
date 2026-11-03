@@ -1,11 +1,13 @@
-ARG CUDA_VERSION="12.4.1"
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+ARG CUDA_VERSION="12.8.0"
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=0 \
     CUDA_MODULE_LOADING=LAZY \
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX" \
+    PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
     LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -54,10 +56,9 @@ RUN mkdir -p /workspace/models/ESRGAN && \
     mkdir -p /workspace/models/GFPGAN && \
     wget -O /workspace/models/GFPGAN/GFPGANv1.3.pth https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth
 
-# Install Torch
-ARG INDEX_URL="https://download.pytorch.org/whl/cu124"
-ARG TORCH_VERSION="2.6.0+cu124"
-RUN pip3 install --no-cache-dir torch==${TORCH_VERSION} torchvision torchaudio --index-url ${INDEX_URL}
+# Install Torch with CUDA 12.8 for universal GPU support (Turing -> Ampere -> Ada -> Hopper -> Blackwell sm_120)
+ARG INDEX_URL="https://download.pytorch.org/whl/cu128"
+RUN pip3 install --no-cache-dir torch torchvision torchaudio --index-url ${INDEX_URL}
 
 # 1. Clone the worker repo
 # 2. Install requirements

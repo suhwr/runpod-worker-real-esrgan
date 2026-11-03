@@ -11,6 +11,8 @@ echo "Starting Serverless Handler"
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=0
 export CUDA_MODULE_LOADING=LAZY
+export TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 if [ -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ]; then
     export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
